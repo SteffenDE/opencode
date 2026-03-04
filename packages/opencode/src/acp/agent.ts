@@ -43,6 +43,7 @@ import { z } from "zod"
 import { LoadAPIKeyError } from "ai"
 import type { AssistantMessage, Event, OpencodeClient, SessionMessageResponse, ToolPart } from "@opencode-ai/sdk/v2"
 import { applyPatch } from "diff"
+import { Identifier } from "@/id/id"
 
 type ModeOption = { id: string; name: string; description?: string }
 type ModelOption = { modelId: string; name: string }
@@ -120,6 +121,22 @@ export namespace ACP {
       })
   }
 
+  function buildUsage(msg: AssistantMessage): Usage {
+    return {
+      totalTokens:
+        msg.tokens.input +
+        msg.tokens.output +
+        msg.tokens.reasoning +
+        (msg.tokens.cache?.read ?? 0) +
+        (msg.tokens.cache?.write ?? 0),
+      inputTokens: msg.tokens.input,
+      outputTokens: msg.tokens.output,
+      thoughtTokens: msg.tokens.reasoning || undefined,
+      cachedReadTokens: msg.tokens.cache?.read || undefined,
+      cachedWriteTokens: msg.tokens.cache?.write || undefined,
+    }
+  }
+
   export async function init({ sdk: _sdk }: { sdk: OpencodeClient }) {
     return {
       create: (connection: AgentSideConnection, fullConfig: ACPConfig) => {
@@ -143,6 +160,16 @@ export namespace ACP {
       { optionId: "always", kind: "allow_always", name: "Always allow" },
       { optionId: "reject", kind: "reject_once", name: "Reject" },
     ]
+    private inFlightPrompts = new Map<
+      string,
+      Array<{
+        messageID: string
+        resolve: (result: { stopReason: "end_turn"; usage?: Usage; _meta: {} }) => void
+        reject: (error: any) => void
+        settled: boolean
+        lastAssistantInfo?: AssistantMessage
+      }>
+    >()
 
     constructor(connection: AgentSideConnection, config: ACPConfig) {
       this.connection = connection
@@ -150,6 +177,14 @@ export namespace ACP {
       this.sdk = config.sdk
       this.sessionManager = new ACPSessionManager(this.sdk)
       this.startEventSubscription()
+    }
+
+    private removeInFlightPrompt(sessionID: string, messageID: string) {
+      const prompts = this.inFlightPrompts.get(sessionID)
+      if (!prompts) return
+      const idx = prompts.findIndex((p) => p.messageID === messageID)
+      if (idx >= 0) prompts.splice(idx, 1)
+      if (prompts.length === 0) this.inFlightPrompts.delete(sessionID)
     }
 
     private startEventSubscription() {
@@ -511,6 +546,37 @@ export namespace ACP {
           }
           return
         }
+
+        case "message.updated": {
+          const info = event.properties.info
+          if (info.role !== "assistant") return
+          if (info.summary) return
+
+          const prompts = this.inFlightPrompts.get(info.sessionID)
+          if (!prompts?.length) return
+
+          // Track the latest completed assistant message for usage data
+          if (info.time.completed) {
+            const entry = prompts.find((p) => p.messageID === info.parentID)
+            if (entry) {
+              entry.lastAssistantInfo = info
+            }
+          }
+
+          // Resolve all in-flight prompts whose user message is older than
+          // this assistant's parent (the loop has moved on to a newer message)
+          while (prompts.length > 0 && prompts[0].messageID < info.parentID) {
+            const entry = prompts.shift()!
+            if (entry.settled) continue
+            entry.settled = true
+            entry.resolve({
+              stopReason: "end_turn",
+              usage: entry.lastAssistantInfo ? buildUsage(entry.lastAssistantInfo) : undefined,
+              _meta: {},
+            })
+          }
+          return
+        }
       }
     }
 
@@ -550,6 +616,11 @@ export namespace ACP {
             fork: {},
             list: {},
             resume: {},
+          },
+          _meta: {
+            opencode: {
+              promptQueueing: true,
+            },
           },
         },
         authMethods: [authMethod],
@@ -1383,41 +1454,54 @@ export namespace ACP {
         return { name, args: rest.join(" ").trim() }
       })()
 
-      const buildUsage = (msg: AssistantMessage): Usage => ({
-        totalTokens:
-          msg.tokens.input +
-          msg.tokens.output +
-          msg.tokens.reasoning +
-          (msg.tokens.cache?.read ?? 0) +
-          (msg.tokens.cache?.write ?? 0),
-        inputTokens: msg.tokens.input,
-        outputTokens: msg.tokens.output,
-        thoughtTokens: msg.tokens.reasoning || undefined,
-        cachedReadTokens: msg.tokens.cache?.read || undefined,
-        cachedWriteTokens: msg.tokens.cache?.write || undefined,
-      })
-
       if (!cmd) {
-        const response = await this.sdk.session.prompt({
-          sessionID,
-          model: {
-            providerID: model.providerID,
-            modelID: model.modelID,
-          },
-          variant: this.sessionManager.getVariant(sessionID),
-          parts,
-          agent,
-          directory,
-        })
-        const msg = response.data?.info
+        const messageID = Identifier.ascending("message")
+        const { promise, resolve, reject } = Promise.withResolvers<{
+          stopReason: "end_turn"
+          usage?: Usage
+          _meta: {}
+        }>()
 
+        const entry = { messageID, resolve, reject, settled: false };
+        const prompts = this.inFlightPrompts.get(sessionID) ?? []
+        prompts.push(entry)
+        this.inFlightPrompts.set(sessionID, prompts)
+
+        // Start the SDK call; it blocks until the loop finishes (fallback resolution)
+        this.sdk.session
+          .prompt({
+            sessionID,
+            messageID,
+            model: {
+              providerID: model.providerID,
+              modelID: model.modelID,
+            },
+            variant: this.sessionManager.getVariant(sessionID),
+            parts,
+            agent,
+            directory,
+          })
+          .then((response) => {
+            if (entry.settled) return
+            entry.settled = true
+            this.removeInFlightPrompt(sessionID, messageID)
+            const msg = response.data?.info
+            resolve({
+              stopReason: "end_turn" as const,
+              usage: msg ? buildUsage(msg) : undefined,
+              _meta: {},
+            })
+          })
+          .catch((error) => {
+            if (entry.settled) return
+            entry.settled = true
+            this.removeInFlightPrompt(sessionID, messageID)
+            reject(error)
+          })
+
+        const result = await promise
         await sendUsageUpdate(this.connection, this.sdk, sessionID, directory)
-
-        return {
-          stopReason: "end_turn" as const,
-          usage: msg ? buildUsage(msg) : undefined,
-          _meta: {},
-        }
+        return result
       }
 
       const command = await this.config.sdk.command
